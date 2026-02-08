@@ -121,20 +121,53 @@ git branch -M main 2>nul
 git push -u origin main 2>nul
 if errorlevel 1 (
     echo.
-    echo  [!] If this is your first push, you may need to:
-    echo      - Create the repo on GitHub: %REMOTE_URL%
-    echo      - Log in: git config --global user.name "Your Name"
-    echo                git config --global user.email "your@email.com"
-    echo      - If you use 2FA, use a Personal Access Token as password
-    echo.
-    git push -u origin main
+    echo  [!] Push rejected (remote has different history^).
+    echo  [*] Pulling remote changes and merging...
+    git fetch origin main 2>nul
+    git pull origin main --allow-unrelated-histories --no-edit 2>nul
     if errorlevel 1 (
-        color 0C
-        echo  [X] Push failed. Check errors above.
-        pause
-        exit /b 1
+        echo.
+        echo  [!] Merge had conflicts or failed. Trying force push to overwrite remote...
+        echo      (Use only if the remote only has a default README and you want your code to win^)
+        set /p FORCE="      Force push? (y/n): "
+        if /i "!FORCE!"=="y" (
+            git push -u origin main --force
+            if errorlevel 1 (
+                color 0C
+                echo  [X] Force push failed.
+                goto :push_failed
+            )
+            goto :push_ok
+        ) else (
+            color 0C
+            echo  [X] Push aborted. Resolve manually: git pull origin main --allow-unrelated-histories, fix conflicts, then git push.
+            goto :push_failed
+        )
+    ) else (
+        echo  [OK] Merged. Pushing again...
+        git push -u origin main
+        if errorlevel 1 (
+            color 0C
+            echo  [X] Push failed after merge.
+            goto :push_failed
+        )
+        goto :push_ok
     )
 )
+goto :push_ok
+
+:push_failed
+echo.
+echo  If this is your first push, you may need to:
+echo  - Create the repo on GitHub: %REMOTE_URL%
+echo  - Log in: git config --global user.name "Your Name"
+echo            git config --global user.email "your@email.com"
+echo  - If you use 2FA, use a Personal Access Token as password
+echo.
+pause
+exit /b 1
+
+:push_ok
 echo.
 color 0A
 echo  ============================================================
