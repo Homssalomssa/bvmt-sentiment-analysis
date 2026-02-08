@@ -1,71 +1,163 @@
+#!/usr/bin/env python3
 """
-Simple FastAPI server for sentiment analysis - Windows compatible
+Simple working API - Scrape → Analyze → Serve
+No complexity, just working endpoints
 """
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from integrate import TradingSentimentSystem
-import uvicorn
+from fastapi.responses import JSONResponse
+import json
 from datetime import datetime
 
-app = FastAPI(title="BVMT Sentiment API", version="1.0")
+app = FastAPI(title="BVMT Sentiment", version="2.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Global cache - populated on first request
+_data_cache = None
 
-system = TradingSentimentSystem()
+
+def _get_data():
+    """Get or create cached data"""
+    global _data_cache
+    
+    if _data_cache is not None:
+        return _data_cache
+    
+    # Import here to avoid issues on module load
+    from scraper_new import SmartNewsScraper
+    from analyzer import SentimentAnalyzer
+    
+    print("Loading scraper and analyzer...")
+    scraper = SmartNewsScraper()
+    analyzer = SentimentAnalyzer()
+    
+    print("Fetching articles...")
+    articles = scraper.get_articles_last_week()
+    
+    # Build sentiment dict
+    sentiments = {}
+    
+    # Process mentioned companies
+    for article in articles:
+        text = f"{article['title']} {article['content']}"
+        result = analyzer.analyze_sentiment(text)
+        
+        for company in article['mentioned_companies']:
+            if company not in sentiments:
+                sentiments[company] = {'scores': [], 'count': 0}
+            sentiments[company]['scores'].append(result['score'])
+            sentiments[company]['count'] += 1
+    
+    # Add unmentioned as neutral
+    for symbol in scraper.stock_symbols:
+        if symbol not in sentiments:
+            sentiments[symbol] = {'scores': [0.0], 'count': 0}
+    
+    # Cache it
+    _data_cache = {
+        'sentiments': sentiments,
+        'articles': articles,
+        'companies': scraper.stock_symbols,
+        'company_info': scraper.company_data,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    return _data_cache
 
 
 @app.get("/")
 def root():
-    return {
-        "service": "BVMT Stock Sentiment Analysis API",
-        "version": "1.0",
-        "endpoints": {
-            "/health": "Check API health",
-            "/sentiment/{symbol}": "Get sentiment for stock",
-            "/sentiment/all": "Get sentiment for all stocks",
-            "/stocks": "List available stocks"
-        }
-    }
-
-
-@app.get("/health")
-def health():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    """Root endpoint - API is alive"""
+    return {"service": "BVMT Sentiment Analysis", "version": "2.0"}
 
 
 @app.get("/sentiment/{symbol}")
-def get_sentiment(symbol: str):
-    result = system.analyze_stock_sentiment(symbol.upper(), max_articles=3)
-    return result
+def sentiment(symbol: str):
+    """Get sentiment for ONE stock"""
+    data = _get_data()
+    symbol = symbol.upper()
+    
+    if symbol not in data['companies']:
+        return JSONResponse({"error": f"Unknown symbol: {symbol}"}, status_code=404)
+    
+    sent = data['sentiments'].get(symbol, {'scores': [0.0], 'count': 0})
+    scores = sent['scores']
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+    
+    return {
+        "symbol": symbol,
+        "score": round(avg_score, 3),
+        "label": "positive" if avg_score > 0.1 else "negative" if avg_score < -0.1 else "neutral",
+        "mentions": sent['count'],
+        "company": data['company_info'].get(symbol, {}).get('fr', symbol)
+    }
 
 
 @app.get("/sentiment/all")
-def get_all_sentiments():
-    stocks = ["ATB", "TUNTEL", "BH", "STB", "AB", "ADWYA", "AMS", "UIB"]
-    results = system.analyze_multiple_stocks(stocks, max_articles_per_stock=2)
+def sentiment_all():
+    """Get ALL stocks sentiment"""
+    data = _get_data()
+    
+    results = []
+    for symbol in data['companies']:
+        sent = data['sentiments'].get(symbol, {'scores': [0.0], 'count': 0})
+        scores = sent['scores']
+        avg = sum(scores) / len(scores) if scores else 0.0
+        
+        results.append({
+            "symbol": symbol,
+            "score": round(avg, 3),
+            "label": "positive" if avg > 0.1 else "negative" if avg < -0.1 else "neutral",
+            "mentions": sent['count']
+        })
+    
+    # Sort by mentions descending
+    results.sort(key=lambda x: x['mentions'], reverse=True)
+    
     return {
-        "timestamp": datetime.now().isoformat(),
-        "stocks_analyzed": len(stocks),
-        "results": results
+        "count": len(results),
+        "data": results
     }
 
 
-@app.get("/stocks")
-def list_stocks():
+@app.get("/articles")
+def articles():
+    """Get all articles with mentions"""
+    data = _get_data()
+    
     return {
-        "tunisian_stocks": system.scraper.stock_symbols,
-        "count": len(system.scraper.stock_symbols)
+        "count": len(data['articles']),
+        "articles": [
+            {
+                "title": a['title'],
+                "source": a['source'],
+                "mentions": a['mentioned_companies'],
+                "date": a['date'].isoformat() if hasattr(a['date'], 'isoformat') else str(a['date'])
+            }
+            for a in data['articles']
+        ]
     }
 
 
-if __name__ == "__main__":
-    print("Starting BVMT Sentiment API on http://localhost:8001")
-    print("API Docs: http://localhost:8001/docs")
-    # Use import string so reload=True works (no warning); Windows-compatible
-    uvicorn.run("api:app", host="0.0.0.0", port=8001, reload=True)
+@app.get("/stats")
+def stats():
+    """Get statistics"""
+    data = _get_data()
+    
+    mentioned_count = sum(1 for s in data['sentiments'].values() if s['count'] > 0)
+    
+    return {
+        "total_companies": len(data['companies']),
+        "mentioned": mentioned_count,
+        "neutral": len(data['companies']) - mentioned_count,
+        "articles": len(data['articles']),
+        "cached_at": data['timestamp']
+    }
+
+
+@app.post("/refresh")
+def refresh():
+    """Force refresh cache"""
+    global _data_cache
+    _data_cache = None
+    data = _get_data()
+    return {"status": "refreshed", "timestamp": data['timestamp']}
